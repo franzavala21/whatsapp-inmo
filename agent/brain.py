@@ -13,10 +13,64 @@ import yaml
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 
+from agent.tools import buscar_propiedades
+
 load_dotenv()
 logger = logging.getLogger("agentkit")
 
 client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+# Unica herramienta conectada al ciclo de tool use de Claude por ahora: el
+# listado de propiedades de Tokko Broker, porque es informacion que cambia
+# todo el tiempo y no puede vivir pegada en el system prompt.
+TOOLS_ANTHROPIC = [
+    {
+        "name": "buscar_propiedades",
+        "description": (
+            "Busca propiedades disponibles ahora mismo en el CRM de Zavala Seppey "
+            "(Tokko Broker). Usar SIEMPRE que el cliente pregunte por propiedades "
+            "disponibles, pida ver opciones, o pregunte el precio de algo puntual: "
+            "nunca inventar propiedades ni precios sin llamar a esta herramienta."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "operacion": {
+                    "type": "string",
+                    "enum": ["venta", "alquiler"],
+                    "description": "Que operacion busca el cliente.",
+                },
+                "tipo": {
+                    "type": "string",
+                    "enum": ["casa", "departamento", "terreno", "oficina"],
+                    "description": "Tipo de propiedad. Omitir si el cliente no lo especifico.",
+                },
+                "zona": {
+                    "type": "string",
+                    "description": "Zona, barrio o direccion que menciono el cliente. Omitir si no dio ninguna.",
+                },
+                "precio_max": {
+                    "type": "number",
+                    "description": "Presupuesto maximo del cliente, si lo menciono. Omitir si no dio uno.",
+                },
+            },
+            "required": ["operacion"],
+        },
+    }
+]
+
+
+async def _ejecutar_herramienta(nombre: str, entrada: dict) -> str:
+    """Despacha una tool_use de Claude a la funcion real de agent/tools.py."""
+    if nombre == "buscar_propiedades":
+        return await buscar_propiedades(
+            operacion=entrada.get("operacion", ""),
+            tipo=entrada.get("tipo"),
+            zona=entrada.get("zona"),
+            precio_max=entrada.get("precio_max"),
+        )
+    logger.error(f"Claude pidio una herramienta que no existe: {nombre}")
+    return "Esa herramienta no esta disponible."
 
 # El modelo se cambia desde .env, sin tocar el codigo.
 #   claude-opus-5     el mas capaz             $5 / $25 por millon de tokens
@@ -123,32 +177,63 @@ async def generar_respuesta(mensaje: str, historial: list[dict]) -> tuple[str, b
     mensajes.append({"role": "user", "content": mensaje})
 
     system_prompt = cargar_system_prompt()
-    extras = {"output_config": {"effort": ESFUERZO}} if (_soporta_esfuerzo and ESFUERZO) else {}
 
-    async def _llamar(parametros_extra: dict):
+    def _extras() -> dict:
+        return {"output_config": {"effort": ESFUERZO}} if (_soporta_esfuerzo and ESFUERZO) else {}
+
+    async def _llamar():
+        # "mensajes" se muta en el ciclo de tool use de abajo (append), por eso
+        # esta funcion no recibe la lista por parametro: siempre lee la ultima version.
         return await client.messages.create(
             model=MODELO,
             max_tokens=MAX_TOKENS,
             system=system_prompt,
             messages=mensajes,
-            **parametros_extra,
+            tools=TOOLS_ANTHROPIC,
+            **_extras(),
         )
 
     try:
-        respuesta = await _llamar(extras)
+        respuesta = await _llamar()
     except Exception as e:  # noqa: BLE001
-        if extras and _es_error_de_esfuerzo(e):
+        if _extras() and _es_error_de_esfuerzo(e):
             logger.warning(
                 f"El modelo {MODELO} no acepta output_config.effort; se reintenta sin ese parametro."
             )
             _soporta_esfuerzo = False
             try:
-                respuesta = await _llamar({})
+                respuesta = await _llamar()
             except Exception as e2:  # noqa: BLE001
                 logger.error(f"Error llamando a Claude: {e2}")
                 return obtener_mensaje_error(), False
         else:
             logger.error(f"Error llamando a Claude: {e}")
+            return obtener_mensaje_error(), False
+
+    # Ciclo de tool use: antes de contestar, Claude puede pedir que se ejecute
+    # buscar_propiedades una o mas veces. El tope de vueltas evita quedar en un
+    # loop infinito si algo sale mal (ej. el resultado de la herramienta no le
+    # alcanza y la vuelve a pedir sin parar).
+    vueltas = 0
+    while getattr(respuesta, "stop_reason", None) == "tool_use" and vueltas < 3:
+        vueltas += 1
+        mensajes.append({"role": "assistant", "content": respuesta.content})
+
+        resultados = [
+            {
+                "type": "tool_result",
+                "tool_use_id": bloque.id,
+                "content": await _ejecutar_herramienta(bloque.name, bloque.input),
+            }
+            for bloque in respuesta.content
+            if bloque.type == "tool_use"
+        ]
+        mensajes.append({"role": "user", "content": resultados})
+
+        try:
+            respuesta = await _llamar()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Error llamando a Claude durante el tool use: {e}")
             return obtener_mensaje_error(), False
 
     if getattr(respuesta, "stop_reason", None) == "max_tokens":
