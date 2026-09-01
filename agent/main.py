@@ -95,19 +95,11 @@ async def health_check():
 
     # Se responde 200 aunque las credenciales esten mal, para que Railway no marque el
     # deploy como caido y puedas leer el diagnostico. El detalle esta en el cuerpo.
-    import hashlib
-
-    try:
-        prompt_hash = hashlib.md5(open("config/prompts.yaml", "rb").read()).hexdigest()[:8]
-    except FileNotFoundError:
-        prompt_hash = "no-encontrado"
-
     return {
         "status": "ok" if estado_proveedor["ok"] else "degradado",
         "service": "agentkit",
         "proveedor": proveedor.__class__.__name__ if proveedor else None,
         "conexion": estado_proveedor,
-        "debug_prompt_hash": prompt_hash,
     }
 
 
