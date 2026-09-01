@@ -78,6 +78,22 @@ class EventoProcesado(Base):
     creado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=ahora, index=True)
 
 
+class NumeroAtendido(Base):
+    """
+    Numeros a los que el bot ya les respondio una vez.
+
+    Zavala Seppey quiere que el bot conteste SOLO la primera consulta de cada
+    numero: despues de esa primera respuesta, el numero queda marcado aca y
+    el bot no le vuelve a escribir nunca mas — la conversacion sigue a mano
+    (clientes o inquilinos ya conocidos no necesitan pasar por el bot).
+    """
+
+    __tablename__ = "numeros_atendidos"
+
+    telefono: Mapped[str] = mapped_column(String(50), primary_key=True)
+    atendido_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=ahora)
+
+
 async def inicializar_db():
     """Crea las tablas si no existen."""
     async with engine.begin() as conn:
@@ -129,6 +145,30 @@ async def limpiar_eventos_viejos(dias: int = 7):
         await session.commit()
     if resultado.rowcount:
         logger.info(f"Se limpiaron {resultado.rowcount} eventos de mas de {dias} dias")
+
+
+async def ya_fue_atendido(telefono: str) -> bool:
+    """True si el bot ya le respondio una vez a este numero."""
+    async with async_session() as session:
+        resultado = await session.execute(
+            select(NumeroAtendido).where(NumeroAtendido.telefono == telefono)
+        )
+        return resultado.scalar_one_or_none() is not None
+
+
+async def marcar_atendido(telefono: str):
+    """
+    Marca un numero como ya atendido, para que el bot no le vuelva a escribir.
+
+    Se llama solo despues de un envio exitoso: si el primer intento falla
+    tecnicamente, el bot tiene que poder responder en el proximo mensaje.
+    """
+    async with async_session() as session:
+        session.add(NumeroAtendido(telefono=telefono, atendido_en=ahora()))
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()  # ya estaba marcado, no pasa nada
 
 
 async def guardar_mensaje(telefono: str, role: str, content: str):

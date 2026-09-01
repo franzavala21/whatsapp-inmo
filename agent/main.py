@@ -22,8 +22,10 @@ from agent.memory import (
     inicializar_db,
     liberar_evento,
     limpiar_eventos_viejos,
+    marcar_atendido,
     marcar_evento_procesado,
     obtener_historial,
+    ya_fue_atendido,
 )
 from agent.providers import obtener_proveedor
 from agent.providers.base import MensajeEntrante
@@ -157,6 +159,12 @@ async def webhook_handler(request: Request, tareas: BackgroundTasks):
             logger.info(f"Evento repetido, se ignora: {evento_id}")
             continue
 
+        # El bot solo contesta la primera consulta de cada numero: despues queda en
+        # silencio y la conversacion sigue a mano (ver marcar_atendido en memory.py).
+        if await ya_fue_atendido(msg.telefono):
+            logger.info(f"{msg.telefono} ya fue atendido antes; el bot no responde")
+            continue
+
         logger.info(f"Mensaje de {msg.telefono}: {msg.texto}")
         tareas.add_task(procesar_mensaje, msg)
         encolados += 1
@@ -197,6 +205,10 @@ async def procesar_mensaje(msg: MensajeEntrante):
             if es_respuesta_real:
                 await guardar_mensaje(msg.telefono, "user", msg.texto)
                 await guardar_mensaje(msg.telefono, "assistant", respuesta)
+                # Recien aca se marca "atendido": si la primera respuesta fue un aviso
+                # tecnico y no una respuesta real, el bot tiene que poder intentarlo de
+                # nuevo en el proximo mensaje de este mismo numero.
+                await marcar_atendido(msg.telefono)
 
             logger.info(f"Respuesta enviada a {msg.telefono}: {respuesta}")
 
